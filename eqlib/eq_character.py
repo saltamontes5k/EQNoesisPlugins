@@ -668,8 +668,12 @@ def _build_ani_from_eqga(ani, bones, anim_name):
             r = eqg_quat(frame.rotation)
             frame_rots.append(NoeQuat(r))
             frame_trans.append(NoeVec3(eqg_to_yup_pos(frame.translation)))
+            # Per-axis scale, not an average: model-specific bones carry
+            # strongly non-uniform keys (apx's CHEST_CLAV_PADL01 is
+            # (0.273, 0.254, 0.589)) and collapsing them to one scalar skews
+            # every vertex that bone owns.
             s = frame.scale
-            frame_scales.append((s[0] + s[1] + s[2]) / 3.0)
+            frame_scales.append((s[0], s[1], s[2]))
             if t > max_time:
                 max_time = t
         all_frames[bone_idx] = (frame_times, frame_rots, frame_trans, frame_scales)
@@ -695,14 +699,28 @@ def _build_ani_from_eqga(ani, bones, anim_name):
                 [NoeKeyFramedValue(times[i], trans[i]) for i in range(len(times))],
                 type=noesis.NOEKF_TRANSLATION_VECTOR_3,
             )
-            # NOEKF_SCALE_SCALAR_1 keys carry a plain float, not a vector.
-            # Some tracks carry garbage (gcst_ba_1_ae3 spikes to -404 on a
-            # lip bone); skip scale keys for those rather than explode the
-            # interpolation between sane keys and the spike.
-            if all(0.001 <= s <= 16.0 for s in scales):
+            # Scale keys: SCALAR_1 (a plain float) is the well-trodden path and
+            # stays for uniform scales. Bones that carry non-uniform scale
+            # (apx's CHEST_CLAV_PADL01 is (0.273, 0.254, 0.589)) need the
+            # per-axis form instead - averaging them skewed the whole mesh.
+            # Some tracks carry garbage (gcst_ba_1_ae3 spikes to -404 on a lip
+            # bone); skip the scale track entirely for those.
+            uniform = True
+            for sc in scales:
+                if abs(sc[0] - sc[1]) > 1e-4 or abs(sc[1] - sc[2]) > 1e-4:
+                    uniform = False
+                    break
+            if uniform:
+                flat = [sc[0] for sc in scales]
+                if all(0.001 <= v <= 16.0 for v in flat):
+                    kf_bone.setScale(
+                        [NoeKeyFramedValue(times[i], flat[i]) for i in range(len(times))],
+                        type=noesis.NOEKF_SCALE_SCALAR_1,
+                    )
+            elif all(0.001 <= v <= 16.0 for sc in scales for v in sc):
                 kf_bone.setScale(
-                    [NoeKeyFramedValue(times[i], scales[i]) for i in range(len(times))],
-                    type=noesis.NOEKF_SCALE_SCALAR_1,
+                    [NoeKeyFramedValue(times[i], NoeVec3(scales[i])) for i in range(len(times))],
+                    type=noesis.NOEKF_SCALE_VECTOR_3,
                 )
         else:
             # Unkeyed bone: pin it to its rest LOCAL. Noesis poses an unkeyed
@@ -715,8 +733,12 @@ def _build_ani_from_eqga(ani, bones, anim_name):
                                 type=noesis.NOEKF_ROTATION_QUATERNION_4)
             kf_bone.setTranslation([NoeKeyFramedValue(t, NoeVec3(tr)) for t in kt],
                                    type=noesis.NOEKF_TRANSLATION_VECTOR_3)
-            kf_bone.setScale([NoeKeyFramedValue(t, sc[0]) for t in kt],
-                             type=noesis.NOEKF_SCALE_SCALAR_1)
+            if abs(sc[0] - sc[1]) < 1e-4 and abs(sc[1] - sc[2]) < 1e-4:
+                kf_bone.setScale([NoeKeyFramedValue(t, sc[0]) for t in kt],
+                                 type=noesis.NOEKF_SCALE_SCALAR_1)
+            else:
+                kf_bone.setScale([NoeKeyFramedValue(t, NoeVec3(sc)) for t in kt],
+                                 type=noesis.NOEKF_SCALE_VECTOR_3)
         kf_bones.append(kf_bone)
 
     fps = 30.0

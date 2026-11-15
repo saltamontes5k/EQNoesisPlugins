@@ -671,8 +671,12 @@ def build_wld_anims_multi(wlds, bones, axis='nonzone'):
                                type=noesis.NOEKF_ROTATION_QUATERNION_4)
                 kf.setTranslation([NoeKeyFramedValue(t, NoeVec3(tr)) for t in kt],
                                   type=noesis.NOEKF_TRANSLATION_VECTOR_3)
-                kf.setScale([NoeKeyFramedValue(t, sc[0]) for t in kt],
-                            type=noesis.NOEKF_SCALE_SCALAR_1)
+                if abs(sc[0] - sc[1]) < 1e-4 and abs(sc[1] - sc[2]) < 1e-4:
+                    kf.setScale([NoeKeyFramedValue(t, sc[0]) for t in kt],
+                                type=noesis.NOEKF_SCALE_SCALAR_1)
+                else:
+                    kf.setScale([NoeKeyFramedValue(t, NoeVec3(sc)) for t in kt],
+                                type=noesis.NOEKF_SCALE_VECTOR_3)
             kf_bones.append(kf)
         # min() with a default kwarg needs Python 3.4+; Noesis embeds an
         # older interpreter.
@@ -702,8 +706,12 @@ def build_bind_pose_anim(bones, name="T-Pose"):
                            type=noesis.NOEKF_ROTATION_QUATERNION_4)
             kf.setTranslation([NoeKeyFramedValue(t, NoeVec3(tr)) for t in kt],
                               type=noesis.NOEKF_TRANSLATION_VECTOR_3)
-            kf.setScale([NoeKeyFramedValue(t, sc[0]) for t in kt],
-                        type=noesis.NOEKF_SCALE_SCALAR_1)
+            if abs(sc[0] - sc[1]) < 1e-4 and abs(sc[1] - sc[2]) < 1e-4:
+                kf.setScale([NoeKeyFramedValue(t, sc[0]) for t in kt],
+                            type=noesis.NOEKF_SCALE_SCALAR_1)
+            else:
+                kf.setScale([NoeKeyFramedValue(t, NoeVec3(sc)) for t in kt],
+                            type=noesis.NOEKF_SCALE_VECTOR_3)
             kf_bones.append(kf)
         return NoeKeyFramedAnim(name, bones, kf_bones, 30.0)
     except Exception:
