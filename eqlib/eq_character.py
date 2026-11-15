@@ -202,12 +202,15 @@ def _load_eqg_models(archive, mdl_list):
     return 1
 
 
-# Per-axis scale keys. EQMV composes local transforms with the full 3-component
-# scale, so NOEKF_SCALE_VECTOR_3 is the faithful form - but no shipped Noesis
-# plugin uses that key type, so it is the first thing to suspect if a model
-# with non-uniform scale keys (apx 16.1% of its keys, vaf 3.2%, bee/ahf 0.0%)
-# deforms oddly. Set False to fall back to the scalar average.
-EQG_VECTOR_SCALE = True
+# Per-axis scale keys are OFF. The bind now carries no scale and every key is a
+# RATIO against the bone's stored scale, so a bone whose scale never changes
+# keys a flat 1.0 (apx: 26,018 of 26,018 keys) and cancels exactly, the way it
+# does in EQMV where pose and rest both carry the same scale. What is left is
+# real animated squash, and the measured anisotropy across every character
+# archive is at most 1.111 (vaf: 0.9 against 1.0), so the scalar average loses
+# under 5% - not worth depending on NOEKF_SCALE_VECTOR_3, which no shipped
+# Noesis plugin exercises.
+EQG_VECTOR_SCALE = False
 
 
 def _build_noe_bones_from_mod(mod_bones):
@@ -235,6 +238,7 @@ def _build_noe_bones_from_mod(mod_bones):
     bone_names = []
     bone_parents = []
     local_mats = []
+    rest_scales = []
 
     while stack:
         orig_idx, parent_idx, parent_name = stack.pop()
@@ -244,11 +248,19 @@ def _build_noe_bones_from_mod(mod_bones):
         bone = mod_bones[orig_idx]
         new_idx = len(bone_names)
         q = quat_normalize(eqg_quat(bone.rotation))
+        # Bind carries rotation+translation only; the bone's stored scale is
+        # kept aside and the animation divides by it. That makes the skinning
+        # invariant to whether the host honours scale in the bone matrices:
+        #   posed(scale A) * bind(scale R)^-1  ==  posed(A/R) * bind(scale 1)^-1
+        # EQMV composes the full 3-axis scale both sides, so a constant scale
+        # cancels there; dividing here reproduces that with scalar keys only.
         local = mat43_from_quat_translation_scale(
-            q, eqg_to_yup_pos(bone.pivot), bone.scale)
+            q, eqg_to_yup_pos(bone.pivot), (1.0, 1.0, 1.0))
+        bone_rest_scale = tuple(bone.scale) if bone.scale else (1.0, 1.0, 1.0)
         bone_names.append(bone.name or 'bone_%d' % new_idx)
         bone_parents.append(parent_idx)
         local_mats.append(local)
+        rest_scales.append(bone_rest_scale)
         orig_to_new[orig_idx] = new_idx
         if bone.name:
             name_map[bone.name.lower()] = new_idx
@@ -265,10 +277,11 @@ def _build_noe_bones_from_mod(mod_bones):
             new_idx = len(bone_names)
             q = quat_normalize(eqg_quat(bone.rotation))
             local = mat43_from_quat_translation_scale(
-                q, eqg_to_yup_pos(bone.pivot), bone.scale)
+                q, eqg_to_yup_pos(bone.pivot), (1.0, 1.0, 1.0))
             bone_names.append(bone.name or 'bone_%d' % new_idx)
             bone_parents.append(-1)
             local_mats.append(local)
+            rest_scales.append(tuple(bone.scale) if bone.scale else (1.0, 1.0, 1.0))
             orig_to_new[orig_idx] = new_idx
             if bone.name:
                 name_map[bone.name.lower()] = new_idx
@@ -290,6 +303,7 @@ def _build_noe_bones_from_mod(mod_bones):
         p = bone_parents[i]
         noe_bone = NoeBone(i, bone_names[i], mat43_to_noemat43(worlds[i]),
                            bone_names[p] if p >= 0 else '', p)
+        noe_bone._eq_rest_scale = rest_scales[i]
         bones.append(noe_bone)
 
     inv_binds = []
@@ -657,8 +671,10 @@ def _build_ani_from_eqga(ani, bones, anim_name):
     Keyframes are bone-local, composed by Noesis through the hierarchy.
     """
     bone_name_to_idx = {}
+    rest_scales = {}
     for bone in bones:
         bone_name_to_idx[bone.name.lower()] = bone.index
+        rest_scales[bone.index] = getattr(bone, '_eq_rest_scale', (1.0, 1.0, 1.0))
 
     all_frames = {}
     max_time = 0.0
@@ -681,7 +697,13 @@ def _build_ani_from_eqga(ani, bones, anim_name):
             # (0.273, 0.254, 0.589)) and collapsing them to one scalar skews
             # every vertex that bone owns.
             s = frame.scale
-            frame_scales.append((s[0], s[1], s[2]))
+            # ratio against the bind scale (the bind carries no scale)
+            rs = rest_scales.get(bone_idx, (1.0, 1.0, 1.0))
+            frame_scales.append((
+                s[0] / rs[0] if rs[0] > 1e-6 else s[0],
+                s[1] / rs[1] if rs[1] > 1e-6 else s[1],
+                s[2] / rs[2] if rs[2] > 1e-6 else s[2],
+            ))
             if t > max_time:
                 max_time = t
         all_frames[bone_idx] = (frame_times, frame_rots, frame_trans, frame_scales)
