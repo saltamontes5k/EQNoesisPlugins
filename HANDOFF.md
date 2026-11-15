@@ -164,7 +164,9 @@ Both formats are documented by **quail** (`github.com/dariusuknuis/quail`: `raw/
 - `.ter` vertices: v≤2 = pos3 nrm3 uv2 (32 bytes) with a second uv2 array after the faces; v≥3 = pos3 nrm3 tint4 uv2 uv2 (44 bytes). Faces are `{3×u32, material i32, flags u32}`, material index −1 = "FailsafeShader".
 - The zone axis map is `(-x,-y,z)`, identical to the EQG map, so `.mod` geometry, `.ter` geometry and `.zon` placements compose without a second change of basis.
 
-Known rough edges: EQ's untextured "Failsafe" blocker planes (arena has 960 such faces) draw flat grey over the floor; area volumes and point lights are parsed but not rendered; per-instance LIT colours are parsed but not yet baked into vertex colours; archives with props but no `.ter`/binary `.zon` (e.g. `nektulos.eqg`) fall back to listing each `.mod`.
+Rendered from the .zon so far: **area volumes** as wireframe boxes (`AREA` centre/orientation/extents, same Rz·Ry·Rx order) and **point lights** as small octahedra tinted by `LIGHTCOLOR`; both get their own flat materials. **Baked vertex colours** come from the per-instance `LIT` arrays and the `.ter` tint, with alpha forced to 1.0 because EQ usually stores 0 there. A zone can ship several `.ter` files (`arxmentis` has `ter_am_main` + `ter_arxmentis`) - all are loaded.
+
+Known rough edges: EQ's untextured "Failsafe" blocker planes (arena has 960 such faces) draw flat grey over the floor; the 1.5M-vertex scene budget cuts `arxmentis` off after ~2100 of its 4228 instances (load takes ~10 s there); archives with props but no `.ter`/binary `.zon` (e.g. `nektulos.eqg`) fall back to listing each `.mod`.
 
 ## 8. Debugging tips
 

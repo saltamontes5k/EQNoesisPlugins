@@ -465,28 +465,32 @@ def _build_light_markers(zon, bank, label, out_meshes):
 
 def load_modern_zone(archive, mdl_list):
     """.ter terrain plus the .mod models the .zon places on it."""
-    ter_name = None
-    for fn in archive.get_file_names():
-        if fn.lower().endswith('.ter'):
-            ter_name = fn
-            break
-    label = ter_name.rsplit('.', 1)[0] if ter_name else _zone_label(archive) or 'zone'
+    # A zone can ship several .ter files (arxmentis has ter_am_main and
+    # ter_arxmentis); all of them are ground, so load every one.
+    ter_names = [fn for fn in archive.get_file_names() if fn.lower().endswith('.ter')]
+    ter_name = ter_names[0] if ter_names else None
+    label = _zone_label(archive) or (ter_name.rsplit('.', 1)[0] if ter_name else 'zone')
+    if ter_name:
+        label = ter_name.rsplit('.', 1)[0]
 
     bank = _SceneMaterials(archive)
     meshes = []
     budget = MAX_SCENE_VERTS
 
+    used = 0
     ter = None
-    if ter_name is not None:
+    for name in ter_names:
         try:
-            ter = EqgTerFile(archive.get_file(ter_name))
-            print("[EQ Zone] %s v%d: %d verts / %d faces / %d materials"
-                  % (ter_name, ter.version, len(ter.vertices), len(ter.faces), len(ter.materials)))
+            ter = EqgTerFile(archive.get_file(name))
         except Exception as e:
-            print("[EQ Zone] .ter parse failed: %s" % str(e))
-            ter = None
-
-    used = _build_ter_meshes(ter, bank, label, meshes, budget) if ter is not None else 0
+            print("[EQ Zone] .ter parse failed (%s): %s" % (name, str(e)))
+            continue
+        print("[EQ Zone] %s v%d: %d verts / %d faces / %d materials"
+              % (name, ter.version, len(ter.vertices), len(ter.faces), len(ter.materials)))
+        used += _build_ter_meshes(ter, bank, name.rsplit('.', 1)[0], meshes, max(0, budget - used))
+        if used > budget:
+            print("[EQ Zone] terrain budget reached, skipping remaining .ter files")
+            break
 
     zon_data, zon_name = _find_zon(archive, label)
     placed = missing = 0
