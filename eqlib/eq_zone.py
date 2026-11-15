@@ -21,6 +21,12 @@ from eqlib.eq_mod import EqgModFile
 # at Noesis.
 MAX_SCENE_VERTS = 1500000
 
+# Baked per-vertex colours: the .zon LIT arrays are per-vertex RGBA for each
+# instance and the .ter carries a per-vertex tint. EQ usually leaves the LIT
+# alpha at 0, so alpha is forced opaque or everything renders invisible.
+ZONE_VERTEX_COLORS = True
+ZONE_MARKERS = True
+
 
 def load_zone(archive, mdl_list):
     wld_data = _pick_wld(archive)
@@ -146,6 +152,8 @@ def _build_ter_meshes(ter, bank, label, out_meshes, budget):
     pos = [NoeVec3(map_pos(v.position)) for v in ter.vertices]
     nrm = [NoeVec3(map_nrm(v.normal)) for v in ter.vertices]
     uv = [NoeVec3((v.uv[0], 1.0 - v.uv[1], 0.0)) for v in ter.vertices]
+    tint = [NoeVec4([v.tint[0] / 255.0, v.tint[1] / 255.0, v.tint[2] / 255.0, 1.0])
+            for v in ter.vertices]
     by_mat = {}
     for f in ter.faces:
         by_mat.setdefault(f.material_index if f.material_index >= 0 else 0, []).append(f.indices)
@@ -159,6 +167,8 @@ def _build_ter_meshes(ter, bank, label, out_meshes, budget):
         sub_pos = []
         sub_uv = []
         sub_nrm = []
+        sub_col = []
+        use_col = False
         indices = []
         for tri in tris:
             if max(tri) >= len(pos):
@@ -169,6 +179,7 @@ def _build_ter_meshes(ter, bank, label, out_meshes, budget):
                     sub_pos.append(pos[vi])
                     sub_uv.append(uv[vi])
                     sub_nrm.append(nrm[vi])
+                    sub_col.append(tint[vi])
             indices.append(remap[tri[0]])
             indices.append(remap[tri[1]])
             indices.append(remap[tri[2]])
@@ -177,6 +188,8 @@ def _build_ter_meshes(ter, bank, label, out_meshes, budget):
         mesh = NoeMesh(indices, sub_pos, namer('%s_ter_m%d' % (label, mi)), bank.material_name(gidx))
         mesh.setUVs(sub_uv)
         mesh.setNormals(sub_nrm)
+        if sub_col and ZONE_VERTEX_COLORS:
+            mesh.setColors(sub_col)
         out_meshes.append(mesh)
         used += len(sub_pos)
         if used > budget:
@@ -249,10 +262,10 @@ def _build_instance_meshes(archive, zon, ter_instances, bank, label, out_meshes,
             gidx, _ = bank.add(mat_info)
             slot = acc.get(gidx)
             if slot is None:
-                slot = [[], [], [], [], 0]   # pos, uv, nrm, tris, base
+                slot = [[], [], [], [], 0, []]   # pos, uv, nrm, tris, base, colour
                 acc[gidx] = slot
-            base = slot[4]
             remap = {}
+            lits = inst.lits
             for tri in tris:
                 if max(tri) >= len(verts):
                     continue
@@ -263,6 +276,12 @@ def _build_instance_meshes(archive, zon, ter_instances, bank, label, out_meshes,
                         slot[0].append(NoeVec3(_transform_point(m, eqg_to_yup_pos(v.position))))
                         slot[1].append(NoeVec3((v.uv[0], 1.0 - v.uv[1], 0.0)))
                         slot[2].append(NoeVec3(_transform_normal(m, eqg_to_yup_normal(v.normal))))
+                        if vi < len(lits):
+                            lit = lits[vi]
+                            slot[5].append(NoeVec4([lit[0] / 255.0, lit[1] / 255.0,
+                                                    lit[2] / 255.0, 1.0]))
+                        else:
+                            slot[5].append(NoeVec4([1.0, 1.0, 1.0, 1.0]))
                     slot[3].append(remap[vi])
             slot[4] = len(slot[0])
         total += len(verts)
@@ -280,6 +299,8 @@ def _build_instance_meshes(archive, zon, ter_instances, bank, label, out_meshes,
         mesh = NoeMesh(slot[3], slot[0], namer('%s_inst_m%d' % (label, gidx)), bank.material_name(gidx))
         mesh.setUVs(slot[1])
         mesh.setNormals(slot[2])
+        if slot[5] and ZONE_VERTEX_COLORS:
+            mesh.setColors(slot[5])
         out_meshes.append(mesh)
     return placed, missing
 
@@ -306,6 +327,140 @@ def _find_zon(archive, label):
     except Exception:
         pass
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Area volumes and point lights
+# ---------------------------------------------------------------------------
+def _add_solid_material(bank, name, rgba):
+    """A flat-coloured material for marker geometry (deduped by name)."""
+    key = (name.lower(), '')
+    if key in bank._index:
+        return bank._index[key]
+    idx = len(bank.materials)
+    noe_mat = NoeMaterial(name, '')
+    noe_mat.setDiffuseColor(NoeVec4(list(rgba)))
+    noe_mat.setFlags(noesis.NMATFLAG_TWOSIDED)
+    bank.materials.append(noe_mat)
+    bank._index[key] = idx
+    bank._tex_names[idx] = ''
+    return idx
+
+
+def _quat_euler(rz, ry, rx):
+    return quat_multiply(
+        quat_from_axis_angle((0.0, 0.0, 1.0), cz_safe(rz)),
+        quat_multiply(
+            quat_from_axis_angle((0.0, 1.0, 0.0), cz_safe(ry)),
+            quat_from_axis_angle((1.0, 0.0, 0.0), cz_safe(rx)),
+        ),
+    )
+
+
+def cz_safe(v):
+    return float(v)
+
+
+def _rotate_vec(q, v):
+    """Rotate v by unit quaternion q (x, y, z, w)."""
+    x, y, z, w = q
+    vx, vy, vz = v
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return (vx + w * tx + (y * tz - z * ty),
+            vy + w * ty + (z * tx - x * tz),
+            vz + w * tz + (x * ty - y * tx))
+
+
+def _build_area_markers(zon, bank, label, out_meshes):
+    """Wireframe boxes for the zone's AREA volumes."""
+    if not zon.areas:
+        return 0
+    gidx = _add_solid_material(bank, 'zone_area', (0.15, 0.9, 0.25, 1.0))
+    mat_name = bank.material_name(gidx)
+    pos = []
+    idxs = []
+    for area in zon.areas:
+        hx = abs(float(area.extents[0]))
+        hy = abs(float(area.extents[1]))
+        hz = abs(float(area.extents[2]))
+        if hx <= 0.0 or hy <= 0.0 or hz <= 0.0:
+            continue
+        # AREA orientation follows the add-on: rotations stored RZ, RY, RX and
+        # applied as euler (RX, RY, RZ), i.e. Rz * Ry * Rx.
+        q = _quat_euler(area.orientation[0], area.orientation[1], area.orientation[2])
+        cx, cy, cz = area.center
+        corners = []
+        for sx in (-hx, hx):
+            for sy in (-hy, hy):
+                for sz in (-hz, hz):
+                    rx, ry, rz = _rotate_vec(q, (sx, sy, sz))
+                    corners.append(wld_zone_pos((cx + rx, cy + ry, cz + rz)))
+        # 12 edges, each a thin quad
+        thick = max(1.5, 0.004 * max(hx, hy, hz))
+        pairs = ((0, 1), (2, 3), (4, 5), (6, 7),
+                 (0, 2), (1, 3), (4, 6), (5, 7),
+                 (0, 4), (1, 5), (2, 6), (3, 7))
+        for a, b in pairs:
+            pa = corners[a]
+            pb = corners[b]
+            base = len(pos)
+            # a cross of two thin quads so the edge reads from any angle
+            for axis in (1, 2):
+                for s in (-1.0, 1.0):
+                    off = [0.0, 0.0, 0.0]
+                    off[axis] = s * thick
+                    pos.append(NoeVec3((pa[0] + off[0], pa[1] + off[1], pa[2] + off[2])))
+                    pos.append(NoeVec3((pb[0] + off[0], pb[1] + off[1], pb[2] + off[2])))
+                idxs.extend([base, base + 1, base + 2, base + 2, base + 1, base + 3])
+                base += 4
+    if not idxs:
+        return 0
+    mesh = NoeMesh(idxs, pos, '%s_areas' % label, mat_name)
+    mesh.setNormals([NoeVec3((0.0, 0.0, 1.0))] * len(pos))
+    out_meshes.append(mesh)
+    return len(zon.areas)
+
+
+def _build_light_markers(zon, bank, label, out_meshes):
+    """Small octahedra at each point light, tinted by the light colour."""
+    if not zon.lights:
+        return 0
+    by_colour = {}
+    for light in zon.lights:
+        r, g, b = (max(0.0, min(1.0, float(c))) for c in light.color)
+        key = (round(r, 2), round(g, 2), round(b, 2))
+        by_colour.setdefault(key, []).append(light)
+
+    namer = _unique_mesh_namer()
+    count = 0
+    for key in sorted(by_colour.keys()):
+        r, g, b = key
+        gidx = _add_solid_material(bank, 'zone_light_%02x%02x%02x' % (int(r * 255), int(g * 255), int(b * 255)),
+                                   (r + 0.15, g + 0.15, b + 0.15, 1.0))
+        pos = []
+        idxs = []
+        for light in by_colour[key]:
+            size = max(4.0, min(float(light.radius) * 0.2, 40.0))
+            c = wld_zone_pos(light.position)
+            base = len(pos)
+            pos.extend([
+                NoeVec3((c[0] + size, c[1], c[2])),
+                NoeVec3((c[0] - size, c[1], c[2])),
+                NoeVec3((c[0], c[1] + size, c[2])),
+                NoeVec3((c[0], c[1] - size, c[2])),
+                NoeVec3((c[0], c[1], c[2] + size)),
+                NoeVec3((c[0], c[1], c[2] - size)),
+            ])
+            for a, bb in ((0, 2), (2, 1), (1, 3), (3, 0)):
+                idxs.extend([base + a, base + bb, base + 4])
+                idxs.extend([base + bb, base + a, base + 5])
+            count += 1
+        if idxs:
+            mesh = NoeMesh(idxs, pos, namer('%s_lights' % label), bank.material_name(gidx))
+            out_meshes.append(mesh)
+    return count
 
 
 def load_modern_zone(archive, mdl_list):
@@ -350,6 +505,10 @@ def load_modern_zone(archive, mdl_list):
                 archive, zon, ter, bank, label, meshes, max(0, budget - used))
             print("[EQ Zone] placed %d instances (%d referenced models missing)"
                   % (placed, missing))
+            n_areas = _build_area_markers(zon, bank, label, meshes) if ZONE_MARKERS else 0
+            n_lights = _build_light_markers(zon, bank, label, meshes) if ZONE_MARKERS else 0
+            if n_areas or n_lights:
+                print("[EQ Zone] markers: %d area boxes, %d light markers" % (n_areas, n_lights))
         elif zon is not None:
             print("[EQ Zone] %s is a classic text zone (terrain params only)" % zon_name)
 
