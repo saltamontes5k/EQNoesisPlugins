@@ -563,6 +563,74 @@ def build_wld_anims(wld, bones, axis='nonzone'):
     return build_wld_anims_multi([wld], bones, axis)
 
 
+def _sample_index(times, t):
+    """Index of the key at or before t, and the blend fraction to the next."""
+    n = len(times)
+    if n == 0:
+        return 0, 0.0
+    if t <= times[0]:
+        return 0, 0.0
+    if t >= times[-1]:
+        return n - 1, 0.0
+    lo, hi = 0, n - 1
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if times[mid] <= t:
+            lo = mid
+        else:
+            hi = mid
+    span = times[hi] - times[lo]
+    if span <= 1e-9:
+        return lo, 0.0
+    return lo, (t - times[lo]) / span
+
+
+def _resample_q(times, quats, frame_times):
+    out = []
+    for t in frame_times:
+        i, f = _sample_index(times, t)
+        a = quats[i]
+        b = quats[i + 1] if i + 1 < len(quats) else a
+        if f <= 0.0:
+            out.append(a)
+            continue
+        d = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
+        if d < 0.0:
+            b = (-b[0], -b[1], -b[2], -b[3])
+        q = (a[0] + (b[0] - a[0]) * f,
+             a[1] + (b[1] - a[1]) * f,
+             a[2] + (b[2] - a[2]) * f,
+             a[3] + (b[3] - a[3]) * f)
+        ln = (q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]) ** 0.5
+        out.append((q[0]/ln, q[1]/ln, q[2]/ln, q[3]/ln) if ln > 1e-9 else a)
+    return out
+
+
+def _resample_v(times, vecs, frame_times):
+    out = []
+    for t in frame_times:
+        i, f = _sample_index(times, t)
+        a = vecs[i]
+        b = vecs[i + 1] if i + 1 < len(vecs) else a
+        if f <= 0.0:
+            out.append(a)
+            continue
+        out.append((a[0] + (b[0] - a[0]) * f,
+                    a[1] + (b[1] - a[1]) * f,
+                    a[2] + (b[2] - a[2]) * f))
+    return out
+
+
+def _resample_s(times, vals, frame_times):
+    out = []
+    for t in frame_times:
+        i, f = _sample_index(times, t)
+        a = vals[i]
+        b = vals[i + 1] if i + 1 < len(vals) else a
+        out.append(a if f <= 0.0 else a + (b - a) * f)
+    return out
+
+
 def build_wld_anims_multi(wlds, bones, axis='nonzone'):
     """Noesis keyframed animations from 0x12/0x13 track fragments across one
     or more WLDs (a body archive's rest poses plus companion animation
@@ -627,17 +695,39 @@ def build_wld_anims_multi(wlds, bones, axis='nonzone'):
     rest_locals = rest_local_matrices(bones)
     for anim_name in sorted(anim_tracks.keys()):
         bone_tracks = anim_tracks[anim_name]
+        # Every track in a clip must run on ONE clock. Tracks carry their own
+        # frame_ms and they genuinely differ inside a single animation
+        # (woe_v2's C05 has 16 tracks at 100 ms and 51 at 66 ms), so feeding
+        # each bone its own timestamps while Noesis plays the clip at a single
+        # frameRate makes the bones drift apart - that is the jank. Resample
+        # every track onto the finest rate present.
         end_t = 0.0
+        min_sleep = 1000.0
         for tdef, sleep_ms in bone_tracks.values():
             n = len(tdef.frame_transforms)
             if n > 1:
                 end_t = max(end_t, (n - 1) * sleep_ms / 1000.0)
+            if sleep_ms <= 0:
+                sleep_ms = 100
+            min_sleep = min(min_sleep, float(sleep_ms))
+        if min_sleep <= 0.0 or min_sleep > 1000.0:
+            min_sleep = 100.0
+        fps = 1000.0 / min_sleep
+        frame_times = []
+        n_frames = int(round(end_t * fps)) + 1
+        if n_frames < 2:
+            n_frames = 2
+        for fi in range(n_frames):
+            frame_times.append(fi / fps)
+
         kf_bones = []
         for b in bones:
             kf = NoeKeyFramedBone(b.index)
             entry = bone_tracks.get(b.index)
             if entry is not None:
                 tdef, sleep_ms = entry
+                if sleep_ms <= 0:
+                    sleep_ms = 100
                 times = []
                 rots = []
                 trans = []
@@ -649,21 +739,24 @@ def build_wld_anims_multi(wlds, bones, axis='nonzone'):
                     trans.append(map_trans(xform['translation']))
                     scales.append(xform.get('scale', 1.0))
                 if rots:
-                    kf.setRotation([NoeKeyFramedValue(times[i], NoeQuat(rots[i]))
-                                    for i in range(len(times))],
+                    rs = _resample_q(times, rots, frame_times)
+                    kf.setRotation([NoeKeyFramedValue(frame_times[i], NoeQuat(rs[i]))
+                                    for i in range(n_frames)],
                                    type=noesis.NOEKF_ROTATION_QUATERNION_4)
                 # Track frames carry the FULL local translation and scale -
                 # always set them, since an unset component may otherwise
                 # evaluate as zero/identity and collapse the skeleton during
                 # playback.
-                kf.setTranslation([NoeKeyFramedValue(times[i], NoeVec3(trans[i]))
-                                   for i in range(len(times))],
+                ts = _resample_v(times, trans, frame_times)
+                kf.setTranslation([NoeKeyFramedValue(frame_times[i], NoeVec3(ts[i]))
+                                   for i in range(n_frames)],
                                   type=noesis.NOEKF_TRANSLATION_VECTOR_3)
                 # NOEKF_SCALE_SCALAR_1 keys carry a plain float, not a
                 # vector; skip insane values rather than explode playback.
                 if all(0.001 <= s <= 16.0 for s in scales):
-                    kf.setScale([NoeKeyFramedValue(times[i], scales[i])
-                                 for i in range(len(times))],
+                    ss = _resample_s(times, scales, frame_times)
+                    kf.setScale([NoeKeyFramedValue(frame_times[i], ss[i])
+                                 for i in range(n_frames)],
                                 type=noesis.NOEKF_SCALE_SCALAR_1)
             else:
                 # Bone with no track in this animation: pin it to its rest
@@ -682,10 +775,6 @@ def build_wld_anims_multi(wlds, bones, axis='nonzone'):
                     kf.setScale([NoeKeyFramedValue(t, NoeVec3(sc)) for t in kt],
                                 type=noesis.NOEKF_SCALE_VECTOR_3)
             kf_bones.append(kf)
-        # min() with a default kwarg needs Python 3.4+; Noesis embeds an
-        # older interpreter.
-        sleeps = [v[1] for v in bone_tracks.values()]
-        fps = max(1.0, 1000.0 / (min(sleeps) if sleeps else 100))
         anims.append(NoeKeyFramedAnim(anim_name, bones, kf_bones, fps))
     return anims
 
