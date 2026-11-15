@@ -9,6 +9,7 @@ from eqlib.eq_material import load_texture_from_archive
 from eqlib.eq_mat43 import (
     wld_zone_pos, wld_zone_nrm, wld_zone_trans, wld_zone_quat,
     mat43_from_quat_translation_scale, quat_multiply, quat_from_axis_angle,
+    bone_matrix, mat43_to_noemat43,
 )
 from eqlib.eq_wldbuild import build_actor_models, build_all_meshes_model, _unique_mesh_namer
 from eqlib.eq_ter import EqgTerFile
@@ -332,6 +333,51 @@ def _find_zon(archive, label):
 # ---------------------------------------------------------------------------
 # Area volumes and point lights
 # ---------------------------------------------------------------------------
+def _grid_layout(models):
+    """Lay models out on a grid, for archives that ship no placement data."""
+    import math as _math
+    boxes = []
+    biggest = 1.0
+    for mdl in models:
+        lo = [1e18, 1e18, 1e18]
+        hi = [-1e18, -1e18, -1e18]
+        for mesh in mdl.meshes:
+            for p in mesh.positions:
+                for a in range(3):
+                    if p[a] < lo[a]:
+                        lo[a] = p[a]
+                    if p[a] > hi[a]:
+                        hi[a] = p[a]
+        for a in range(3):
+            if lo[a] > hi[a]:
+                lo[a] = hi[a] = 0.0
+        boxes.append((lo, hi))
+        size = max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])
+        if size > biggest:
+            biggest = size
+    cell = biggest * 1.25
+    cols = int(_math.ceil(_math.sqrt(len(models))))
+    for i, mdl in enumerate(models):
+        lo, hi = boxes[i]
+        cx = (lo[0] + hi[0]) * 0.5
+        cy = (lo[1] + hi[1]) * 0.5
+        tx = (i % cols) * cell - (cols - 1) * cell * 0.5 - cx
+        ty = (i // cols) * cell - cy
+        for mesh in mdl.meshes:
+            mesh.setPositions([NoeVec3((p[0] + tx, p[1] + ty, p[2])) for p in mesh.positions])
+        try:
+            for bone in getattr(mdl, 'bones', []):
+                mat = bone_matrix(bone)
+                moved = [list(mat[r]) for r in range(4)]
+                moved[3] += tx
+                moved[7] += ty
+                bone.setMatrix(mat43_to_noemat43(moved))
+        except Exception:
+            pass
+    print("[EQ Zone] no placement data: laid %d props out on a %dx grid"
+          % (len(models), cols))
+
+
 def _add_solid_material(bank, name, rgba):
     """A flat-coloured material for marker geometry (deduped by name)."""
     key = (name.lower(), '')
@@ -522,7 +568,14 @@ def load_modern_zone(archive, mdl_list):
         # .mod props as separate models so the archive still previews.
         print("[EQ Zone] no .ter/.zon geometry; falling back to the prop list")
         from eqlib.eq_character import _load_eqg_models
-        return _load_eqg_models(archive, mdl_list)
+        result = _load_eqg_models(archive, mdl_list)
+        if len(mdl_list) > 1:
+            # No placement data at all (atiiki's .zon is the classic text form,
+            # terrain parameters only), so every .mod would sit at the origin
+            # and they all pile up. Spread them out so the props can at least
+            # be looked at individually.
+            _grid_layout(mdl_list)
+        return result
 
     mdl = NoeModel(meshes, [], [], NoeModelMaterials(bank.textures, bank.materials))
     try:

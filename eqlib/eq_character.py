@@ -202,6 +202,14 @@ def _load_eqg_models(archive, mdl_list):
     return 1
 
 
+# Per-axis scale keys. EQMV composes local transforms with the full 3-component
+# scale, so NOEKF_SCALE_VECTOR_3 is the faithful form - but no shipped Noesis
+# plugin uses that key type, so it is the first thing to suspect if a model
+# with non-uniform scale keys (apx 16.1% of its keys, vaf 3.2%, bee/ahf 0.0%)
+# deforms oddly. Set False to fall back to the scalar average.
+EQG_VECTOR_SCALE = True
+
+
 def _build_noe_bones_from_mod(mod_bones):
     """NoeBone list with WORLD bind matrices.
 
@@ -717,11 +725,18 @@ def _build_ani_from_eqga(ani, bones, anim_name):
                         [NoeKeyFramedValue(times[i], flat[i]) for i in range(len(times))],
                         type=noesis.NOEKF_SCALE_SCALAR_1,
                     )
-            elif all(0.001 <= v <= 16.0 for sc in scales for v in sc):
+            elif EQG_VECTOR_SCALE and all(0.001 <= v <= 16.0 for sc in scales for v in sc):
                 kf_bone.setScale(
                     [NoeKeyFramedValue(times[i], NoeVec3(scales[i])) for i in range(len(times))],
                     type=noesis.NOEKF_SCALE_VECTOR_3,
                 )
+            elif not EQG_VECTOR_SCALE:
+                flat = [(sc[0] + sc[1] + sc[2]) / 3.0 for sc in scales]
+                if all(0.001 <= v <= 16.0 for v in flat):
+                    kf_bone.setScale(
+                        [NoeKeyFramedValue(times[i], flat[i]) for i in range(len(times))],
+                        type=noesis.NOEKF_SCALE_SCALAR_1,
+                    )
         else:
             # Unkeyed bone: pin it to its rest LOCAL. Noesis poses an unkeyed
             # bone at its bind WORLD matrix, so the moment a parent is keyed
