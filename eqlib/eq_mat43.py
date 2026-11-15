@@ -158,17 +158,23 @@ def wld_zone_quat(q):
     return (-q[0], -q[1], q[2], q[3])
 
 # --- WLD non-zone (characters, equipment) path ---
+# Same map as the zone path and as EQG. It used to be identity, which left
+# every .s3d character yawed 180 degrees against the EQG creatures: EQG models
+# (ahf and friends) face Noesis's default camera, and WLD ones faced away from
+# it - the "the spine needs rotating 180, he's facing backwards" report on
+# auk_chr and woe_chr. The two must share a frame, and this is the one the rest
+# of the pipeline already uses.
 def wld_nonzone_pos(pos):
-    return (pos[0], pos[1], pos[2])
+    return (-pos[0], -pos[1], pos[2])
 
 def wld_nonzone_nrm(nrm):
-    return (nrm[0], nrm[1], nrm[2])
+    return (-nrm[0], -nrm[1], nrm[2])
 
 def wld_nonzone_trans(t):
-    return (t[0], t[1], t[2])
+    return (-t[0], -t[1], t[2])
 
 def wld_nonzone_quat(q):
-    return (q[0], q[1], q[2], q[3])
+    return (-q[0], -q[1], q[2], q[3])
 
 # --- EQG path ---
 def eqg_to_yup_pos(pos):
