@@ -28,6 +28,7 @@ class EqgAniFile(object):
         self.version = 0
         self.is_strict = False
         self.bone_anims = []
+        self.duration_ms = 0
         self._parse(data)
 
     def _parse(self, data):
@@ -37,6 +38,9 @@ class EqgAniFile(object):
         if magic != b'EQGA':
             return
 
+        # "EQGA", version, string-table length, bone count, a flag (v2), the
+        # bone names, then per bone {frame count, name offset} and 44-byte
+        # keys {u32 ms, pos3, quat xyzw, scale3}. Source: Everquest_Model_Viewer.
         self.version = struct.unpack('<I', stream.read(4))[0]
         name_length = struct.unpack('<I', stream.read(4))[0]
         bone_count = struct.unpack('<I', stream.read(4))[0]
@@ -55,18 +59,14 @@ class EqgAniFile(object):
 
             for _ in range(frame_count):
                 frame = EqgBoneFrame()
+                # Key timestamps are absolute milliseconds, not deltas.
                 frame.milliseconds = struct.unpack('<I', stream.read(4))[0]
-                frame.translation = (struct.unpack('<f', stream.read(4))[0],
-                                    struct.unpack('<f', stream.read(4))[0],
-                                    struct.unpack('<f', stream.read(4))[0])
-                frame.rotation = (struct.unpack('<f', stream.read(4))[0],
-                                 struct.unpack('<f', stream.read(4))[0],
-                                 struct.unpack('<f', stream.read(4))[0],
-                                 struct.unpack('<f', stream.read(4))[0])
-                frame.scale = (struct.unpack('<f', stream.read(4))[0],
-                              struct.unpack('<f', stream.read(4))[0],
-                              struct.unpack('<f', stream.read(4))[0])
+                frame.translation = struct.unpack('<3f', stream.read(12))
+                frame.rotation = struct.unpack('<4f', stream.read(16))
+                frame.scale = struct.unpack('<3f', stream.read(12))
                 ba.frames.append(frame)
+                if frame.milliseconds > self.duration_ms:
+                    self.duration_ms = frame.milliseconds
 
             self.bone_anims.append(ba)
 
@@ -91,6 +91,15 @@ def parse_track_name(name):
 
 
 def decompress_track_transform(ft, use_int16=True):
+    """Decode one WLD track frame.
+
+    Old WLDs store eight i16 per frame (w, x, y, z rotation over 32767-ish
+    normalization; x, y, z shift over 256; scale over 256). The last value is
+    a bone scale, not a shift denominator - a gnome's R_POINT carries 163
+    (0.64x weapons), the Luclin human seat bone 6 (verts stored ~40x too big),
+    human/barbarian/gnome/Iksar eyes 244 (seats them in the sockets).
+    Source: Everquest_Model_Viewer decodeTrack.
+    """
     rot_x = float(ft['rotation'][0])
     rot_y = float(ft['rotation'][1])
     rot_z = float(ft['rotation'][2])
@@ -109,7 +118,12 @@ def decompress_track_transform(ft, use_int16=True):
     shift_y = float(ft['shift'][1]) / 256.0
     shift_z = float(ft['shift'][2]) / 256.0
 
+    raw_scale = ft.get('scale', 0)
+    scale = raw_scale / 256.0 if raw_scale > 0 else 1.0
+
+    # Raw WLD axes; callers map positions/rotations with the wld_* helpers.
     return {
-        'translation': (shift_x, -shift_y, shift_z),
+        'translation': (shift_x, shift_y, shift_z),
         'rotation': (rot_x, rot_y, rot_z, rot_w),
+        'scale': scale,
     }

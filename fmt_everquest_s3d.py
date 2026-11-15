@@ -15,7 +15,10 @@ def registerNoesisTypes():
     noesis.setHandlerTypeCheck(handle2, eqCheckType)
     noesis.setHandlerLoadModel(handle2, eqLoadModel)
 
-    noesis.logPopup()
+    # No noesis.logPopup() here: it pops a modal Debug Log window on every
+    # startup. Debugging trick that does work in the host: temporarily add
+    # logPopup() above and redirect sys.stdout to a file at the top of
+    # eqLoadModel - Noesis swallows printed output otherwise.
     print("[EQ] Plugin registered OK")
     return 1
 
@@ -57,6 +60,12 @@ def _detect_content_type(archive):
     has_lay = any(fn.endswith('.lay') for fn in file_names)
     has_ter = any(fn.endswith('.ter') for fn in file_names)
 
+    # A modern zone archive has no .wld at all: the ground is a .ter and the
+    # props are .mod files placed by a .zon. Check this before the .mod rules
+    # below, or such archives land in the character/equipment paths.
+    if has_ter or (has_zon and has_mod):
+        return _CONTENT_ZONE
+
     if has_mod or has_mds:
         if has_ani or has_zon or has_lay:
             return _CONTENT_CHARACTER
@@ -79,6 +88,12 @@ def _detect_content_type(archive):
 
     if has_zon or has_ter:
         return _CONTENT_ZONE
+
+    # Geometry-free archives (armor .lay + textures, .pts/.prt/.eff effects)
+    # have nothing to build. Route them through the character/equipment loader
+    # so it can say what they are; the zone loader would just return 0 silently.
+    if not has_wld and not has_mod and not has_mds and (has_lay or has_pts or has_prt or has_eff):
+        return _CONTENT_CHARACTER
 
     return _CONTENT_ZONE
 

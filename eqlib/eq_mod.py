@@ -76,6 +76,81 @@ class EqgMaterial(object):
         self.animation_textures = []
 
 
+def _read_material(stream, name_table):
+    """Read one EQGM/EQGS material.
+
+    Layout (per Everquest_Model_Viewer readMOD/readMDS): {index u32, nameOff
+    i32, shaderOff i32, propCount u32} then props {nameOff i32, type u32,
+    value 4}. All three offsets are always present - reading them
+    conditionally desyncs the stream.
+    """
+    mat = EqgMaterial()
+    mat.id = struct.unpack('<i', stream.read(4))[0]
+    mat.name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
+    mat.shader = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
+    param_count = struct.unpack('<I', stream.read(4))[0]
+    for _ in range(param_count):
+        prop_name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
+        prop_type = struct.unpack('<I', stream.read(4))[0]
+        if prop_type == 0:
+            prop_value = '%.8f' % struct.unpack('<f', stream.read(4))[0]
+        else:
+            val = struct.unpack('<i', stream.read(4))[0]
+            if prop_type == 2:
+                prop_value = name_table.by_offset(val)
+            else:
+                prop_value = str(val)
+        mat.properties.append((prop_name, prop_type, prop_value))
+    return mat
+
+
+def _read_mod_vertex(stream, version):
+    """One .mod vertex.
+
+    v1/v2: pos3 nrm3 uv2 = 32 bytes; v3: pos3 nrm3 rgba uv2 uv2 = 44 bytes.
+    Source: Everquest_Model_Viewer readMOD.
+    """
+    vtx = EqgModVertex()
+    vtx.position = struct.unpack('<3f', stream.read(12))
+    vtx.normal = struct.unpack('<3f', stream.read(12))
+    if version >= 3:
+        vtx.tint = struct.unpack('<4B', stream.read(4))
+    vtx.uv = struct.unpack('<2f', stream.read(8))
+    if version >= 3:
+        vtx.uv2 = struct.unpack('<2f', stream.read(8))
+    return vtx
+
+
+def _read_bones(stream, name_table, bone_count):
+    """56-byte bones {nameOff, sibling, childCount, firstChild, pos3, quat4, scale3}."""
+    bones = []
+    for _ in range(bone_count):
+        bone = EqgModBone()
+        bone.name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
+        bone.next_index = struct.unpack('<i', stream.read(4))[0]
+        bone.children_count = struct.unpack('<I', stream.read(4))[0]
+        bone.child_index = struct.unpack('<i', stream.read(4))[0]
+        bone.pivot = struct.unpack('<3f', stream.read(12))
+        bone.rotation = struct.unpack('<4f', stream.read(16))
+        bone.scale = struct.unpack('<3f', stream.read(12))
+        bones.append(bone)
+    return bones
+
+
+def _read_weights(stream, vertices, count):
+    """Per-vertex weight records {u32 count, 4 x (i32 bone, f32 weight)} = 36 bytes."""
+    for vi in range(min(count, len(vertices))):
+        vtx = vertices[vi]
+        n = struct.unpack('<i', stream.read(4))[0]
+        n = min(4, max(0, n))
+        for j in range(4):
+            bi = struct.unpack('<i', stream.read(4))[0]
+            bw = struct.unpack('<f', stream.read(4))[0]
+            if j < n:
+                vtx.bone_indices[j] = bi
+                vtx.bone_weights[j] = bw
+
+
 class EqgModFile(object):
     def __init__(self, data):
         self.version = 0
@@ -105,99 +180,52 @@ class EqgModFile(object):
         name_table.parse(name_data)
 
         for _ in range(material_count):
-            mat = EqgMaterial()
-            mat.id = struct.unpack('<i', stream.read(4))[0]
-            mat.name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
-            if not mat.name:
-                mat.name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
-            else:
-                mat.shader = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
+            self.materials.append(_read_material(stream, name_table))
 
-            param_count = struct.unpack('<I', stream.read(4))[0]
-            for _ in range(param_count):
-                prop_name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
-                prop_type = struct.unpack('<I', stream.read(4))[0]
-                if prop_type == 0:
-                    prop_value = '%.8f' % struct.unpack('<f', stream.read(4))[0]
-                else:
-                    val = struct.unpack('<i', stream.read(4))[0]
-                    if prop_type == 2:
-                        prop_value = name_table.by_offset(val)
-                    else:
-                        prop_value = str(val)
-                mat.properties.append((prop_name, prop_type, prop_value))
-            self.materials.append(mat)
+        # Vertex size: whatever makes the sections add up to the file size
+        # (seen: 32 in v1/v2, 44 in v3); the version's usual size if nothing
+        # fits. Source: Everquest_Model_Viewer readMOD.
+        vsize = 44 if self.version >= 3 else 32
+        if vertex_count:
+            pos = stream.tell()
+            rest = len(data) - pos - face_count * 20 - bone_count * 56 - (vertex_count * 36 if bone_count else 0)
+            if rest > 0 and rest % vertex_count == 0 and 32 <= rest // vertex_count <= 64:
+                vsize = rest // vertex_count
+        if vsize == 32:
+            has_tint = False
+        elif vsize == 44:
+            has_tint = True
+        else:
+            # unusual size: fall back to the version's usual layout
+            has_tint = self.version >= 3
+            vsize = 44 if has_tint else 32
 
         for _ in range(vertex_count):
-            vtx = EqgModVertex()
-            vtx.position = (struct.unpack('<f', stream.read(4))[0],
-                           struct.unpack('<f', stream.read(4))[0],
-                           struct.unpack('<f', stream.read(4))[0])
-            vtx.normal = (struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0])
-            if self.version >= 3:
-                vtx.tint = (struct.unpack('<B', stream.read(1))[0],
-                           struct.unpack('<B', stream.read(1))[0],
-                           struct.unpack('<B', stream.read(1))[0],
-                           struct.unpack('<B', stream.read(1))[0])
-            vtx.uv = (struct.unpack('<f', stream.read(4))[0],
-                     struct.unpack('<f', stream.read(4))[0])
-            if self.version >= 3:
-                vtx.uv2 = (struct.unpack('<f', stream.read(4))[0],
-                          struct.unpack('<f', stream.read(4))[0])
-            self.vertices.append(vtx)
+            self.vertices.append(_read_mod_vertex(stream, 3 if has_tint else 1))
 
         for _ in range(face_count):
             face = EqgModFace()
-            face.indices = (struct.unpack('<I', stream.read(4))[0],
-                           struct.unpack('<I', stream.read(4))[0],
-                           struct.unpack('<I', stream.read(4))[0])
-            mat_id = struct.unpack('<i', stream.read(4))[0]
-            face.material_index = mat_id
-            if 0 <= mat_id < len(self.materials):
-                face.material_name = self.materials[mat_id].name
+            face.indices = struct.unpack('<3I', stream.read(12))
+            face.material_index = struct.unpack('<i', stream.read(4))[0]
+            if 0 <= face.material_index < len(self.materials):
+                face.material_name = self.materials[face.material_index].name
             face.flags = struct.unpack('<I', stream.read(4))[0]
             self.faces.append(face)
 
-        for _ in range(bone_count):
-            bone = EqgModBone()
-            bone.name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
-            bone.next_index = struct.unpack('<i', stream.read(4))[0]
-            bone.children_count = struct.unpack('<I', stream.read(4))[0]
-            bone.child_index = struct.unpack('<i', stream.read(4))[0]
-            bone.pivot = (struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0])
-            bone.rotation = (struct.unpack('<f', stream.read(4))[0],
-                           struct.unpack('<f', stream.read(4))[0],
-                           struct.unpack('<f', stream.read(4))[0],
-                           struct.unpack('<f', stream.read(4))[0])
-            bone.scale = (struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0])
-            self.bones.append(bone)
-
         if bone_count > 0:
-            for vi in range(vertex_count):
-                count = struct.unpack('<i', stream.read(4))[0]
-                for j in range(4):
-                    bi = struct.unpack('<i', stream.read(4))[0]
-                    bw = struct.unpack('<f', stream.read(4))[0]
-                    if j < count:
-                        self.vertices[vi].bone_indices[j] = bi
-                        self.vertices[vi].bone_weights[j] = bw
+            self.bones = _read_bones(stream, name_table, bone_count)
+            _read_weights(stream, self.vertices, vertex_count)
 
 
 class EqgMdsModel(object):
-    __slots__ = ('name', 'main_piece', 'vertices', 'faces', 'bone_count')
+    __slots__ = ('name', 'main_piece', 'vertices', 'faces', 'weight_count')
 
     def __init__(self):
         self.name = ''
         self.main_piece = 0
         self.vertices = []
         self.faces = []
-        self.bone_count = 0
+        self.weight_count = 0
 
 
 class EqgMdsFile(object):
@@ -227,45 +255,9 @@ class EqgMdsFile(object):
         name_table.parse(name_data)
 
         for _ in range(material_count):
-            mat = EqgMaterial()
-            mat.id = struct.unpack('<i', stream.read(4))[0]
-            mat.name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
-            if not mat.name:
-                mat.name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
-            else:
-                mat.shader = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
-            param_count = struct.unpack('<I', stream.read(4))[0]
-            for _ in range(param_count):
-                prop_name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
-                prop_type = struct.unpack('<I', stream.read(4))[0]
-                if prop_type == 0:
-                    prop_value = '%.8f' % struct.unpack('<f', stream.read(4))[0]
-                else:
-                    val = struct.unpack('<i', stream.read(4))[0]
-                    if prop_type == 2:
-                        prop_value = name_table.by_offset(val)
-                    else:
-                        prop_value = str(val)
-                mat.properties.append((prop_name, prop_type, prop_value))
-            self.materials.append(mat)
+            self.materials.append(_read_material(stream, name_table))
 
-        for _ in range(bone_count):
-            bone = EqgModBone()
-            bone.name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
-            bone.next_index = struct.unpack('<i', stream.read(4))[0]
-            bone.children_count = struct.unpack('<I', stream.read(4))[0]
-            bone.child_index = struct.unpack('<i', stream.read(4))[0]
-            bone.pivot = (struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0])
-            bone.rotation = (struct.unpack('<f', stream.read(4))[0],
-                           struct.unpack('<f', stream.read(4))[0],
-                           struct.unpack('<f', stream.read(4))[0],
-                           struct.unpack('<f', stream.read(4))[0])
-            bone.scale = (struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0])
-            self.bones.append(bone)
+        self.bones = _read_bones(stream, name_table, bone_count)
 
         for _ in range(model_count):
             model = EqgMdsModel()
@@ -273,66 +265,46 @@ class EqgMdsFile(object):
             model.name = name_table.by_offset(struct.unpack('<i', stream.read(4))[0])
             m_vertex_count = struct.unpack('<I', stream.read(4))[0]
             m_face_count = struct.unpack('<I', stream.read(4))[0]
-            model.bone_count = struct.unpack('<I', stream.read(4))[0]
+            model.weight_count = struct.unpack('<I', stream.read(4))[0]
 
+            # .mds vertices are always 32 bytes (pos3 nrm3 uv2), whatever the
+            # version. Source: Everquest_Model_Viewer readMDS.
             for _ in range(m_vertex_count):
-                vtx = EqgModVertex()
-                vtx.position = (struct.unpack('<f', stream.read(4))[0],
-                               struct.unpack('<f', stream.read(4))[0],
-                               struct.unpack('<f', stream.read(4))[0])
-                vtx.normal = (struct.unpack('<f', stream.read(4))[0],
-                             struct.unpack('<f', stream.read(4))[0],
-                             struct.unpack('<f', stream.read(4))[0])
-                if self.version >= 3:
-                    vtx.tint = (struct.unpack('<B', stream.read(1))[0],
-                               struct.unpack('<B', stream.read(1))[0],
-                               struct.unpack('<B', stream.read(1))[0],
-                               struct.unpack('<B', stream.read(1))[0])
-                vtx.uv = (struct.unpack('<f', stream.read(4))[0],
-                         struct.unpack('<f', stream.read(4))[0])
-                if self.version >= 3:
-                    vtx.uv2 = (struct.unpack('<f', stream.read(4))[0],
-                              struct.unpack('<f', stream.read(4))[0])
-                model.vertices.append(vtx)
+                model.vertices.append(_read_mod_vertex(stream, 1))
 
             for _ in range(m_face_count):
                 face = EqgModFace()
-                face.indices = (struct.unpack('<I', stream.read(4))[0],
-                               struct.unpack('<I', stream.read(4))[0],
-                               struct.unpack('<I', stream.read(4))[0])
-                mat_id = struct.unpack('<i', stream.read(4))[0]
-                face.material_index = mat_id
-                if 0 <= mat_id < len(self.materials):
-                    face.material_name = self.materials[mat_id].name
+                face.indices = struct.unpack('<3I', stream.read(12))
+                face.material_index = struct.unpack('<i', stream.read(4))[0]
+                if 0 <= face.material_index < len(self.materials):
+                    face.material_name = self.materials[face.material_index].name
                 face.flags = struct.unpack('<I', stream.read(4))[0]
                 model.faces.append(face)
 
-            if bone_count > 0:
-                for _ in range(m_vertex_count):
-                    count = struct.unpack('<i', stream.read(4))[0]
-                    vtx = model.vertices[len(model.vertices) - m_vertex_count + _]
-                    for j in range(4):
-                        bi = struct.unpack('<i', stream.read(4))[0]
-                        bw = struct.unpack('<f', stream.read(4))[0]
-                        if j < count:
-                            vtx.bone_indices[j] = bi
-                            vtx.bone_weights[j] = bw
-
+            _read_weights(stream, model.vertices, model.weight_count)
             self.models.append(model)
 
 
 def build_bone_tree(bones):
+    """Derive the parent/child structure from firstChild + sibling chains.
+
+    Children are NOT always consecutive in the bone table (ahf.mds scatters
+    them), so walk each bone's child_index then follow the children's
+    next_index (sibling) links - the same traversal Everquest_Model_Viewer
+    uses. Assuming consecutiveness orphans ~30 bones of the Akhevan female
+    and detaches her legs/spine.
+    """
     children = {i: [] for i in range(len(bones))}
     is_child = {i: False for i in range(len(bones))}
 
     for i, bone in enumerate(bones):
-        if bone.children_count > 0 and bone.child_index >= 0:
-            idx = bone.child_index
-            for _ in range(bone.children_count):
-                if 0 <= idx < len(bones):
-                    children[i].append(idx)
-                    is_child[idx] = True
-                    idx += 1
+        c = bone.child_index
+        guard = 0
+        while 0 <= c < len(bones) and guard <= len(bones):
+            children[i].append(c)
+            is_child[c] = True
+            c = bones[c].next_index
+            guard += 1
 
     roots = [i for i in range(len(bones)) if not is_child[i]]
     if not roots and len(bones) > 0:

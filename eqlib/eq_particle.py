@@ -67,72 +67,71 @@ def build_particle_placeholder_geometry(particle, position=(0.0, 0.0, 0.0)):
 
 
 def parse_pts(data):
+    """EQPT attachment points: u32 count at +4, then 164-byte records
+    {name[64], bone[64], pos3, rot3 (euler), scale3}.
+    Source: Everquest_Model_Viewer readPTS.
+    """
     points = []
-    stream = io.BytesIO(data)
-    magic = stream.read(4)
-    if magic != b'EQGP':
+    if len(data) < 12 or data[:4] != b'EQPT':
         return points
-
-    header_size = struct.unpack('<I', stream.read(4))[0]
-    version = struct.unpack('<I', stream.read(4))[0]
-    count = struct.unpack('<I', stream.read(4))[0]
-
-    for _ in range(count):
-        name_len = struct.unpack('<I', stream.read(4))[0]
-        name = stream.read(name_len).rstrip(b'\x00').decode('latin-1', errors='replace')
-        bone_name_len = struct.unpack('<I', stream.read(4))[0]
-        bone_name = stream.read(bone_name_len).rstrip(b'\x00').decode('latin-1', errors='replace')
-        translation = (struct.unpack('<f', stream.read(4))[0],
-                      struct.unpack('<f', stream.read(4))[0],
-                      struct.unpack('<f', stream.read(4))[0])
-        rotation = (struct.unpack('<f', stream.read(4))[0],
-                   struct.unpack('<f', stream.read(4))[0],
-                   struct.unpack('<f', stream.read(4))[0],
-                   struct.unpack('<f', stream.read(4))[0])
-        scale = (struct.unpack('<f', stream.read(4))[0],
-                struct.unpack('<f', stream.read(4))[0],
-                struct.unpack('<f', stream.read(4))[0])
+    count = struct.unpack_from('<I', data, 4)[0]
+    for i in range(count):
+        o = 12 + i * 164
+        if o + 164 > len(data):
+            break
+        name = data[o:o + 64].split(b'\x00', 1)[0].decode('latin-1', errors='replace')
+        bone = data[o + 64:o + 128].split(b'\x00', 1)[0].decode('latin-1', errors='replace')
+        pos = struct.unpack_from('<3f', data, o + 128)
+        rot = struct.unpack_from('<3f', data, o + 140)
+        scale = struct.unpack_from('<3f', data, o + 152)
         points.append({
             'name': name,
-            'bone_name': bone_name,
-            'translation': translation,
-            'rotation': rotation,
+            'bone_name': bone,
+            'translation': pos,
+            'rotation': rot,
             'scale': scale,
         })
     return points
 
 
 def parse_prt(data):
+    """PTCL particle triggers: u32 count at +4, u32 version at +8, then
+    104-byte (v4) or 108-byte (v5) records {id, name[64], 9 x u32}.
+    Source: Everquest_Model_Viewer readPRT.
+    """
     renders = []
-    stream = io.BytesIO(data)
-    magic = stream.read(4)
-    if magic != b'EQGR':
+    if len(data) < 12 or data[:4] != b'PTCL':
         return renders
-
-    header_size = struct.unpack('<I', stream.read(4))[0]
-    version = struct.unpack('<I', stream.read(4))[0]
-    count = struct.unpack('<I', stream.read(4))[0]
-
-    for _ in range(count):
-        entry = {
-            'id': struct.unpack('<I', stream.read(4))[0],
-            'id2': struct.unpack('<I', stream.read(4))[0],
-        }
-        particle_point_len = struct.unpack('<I', stream.read(4))[0]
-        entry['particle_point'] = stream.read(particle_point_len).rstrip(b'\x00').decode('latin-1', errors='replace')
-        particle_suffix_len = struct.unpack('<I', stream.read(4))[0]
-        entry['particle_suffix'] = stream.read(particle_suffix_len).rstrip(b'\x00').decode('latin-1', errors='replace')
-
-        if version >= 2:
-            unknown_count = struct.unpack('<I', stream.read(4))[0]
-            entry['unknowns'] = []
-            for _ in range(unknown_count):
-                unk_len = struct.unpack('<I', stream.read(4))[0]
-                entry['unknowns'].append(stream.read(unk_len).rstrip(b'\x00').decode('latin-1', errors='replace'))
-
-        entry['duration'] = struct.unpack('<I', stream.read(4))[0]
-        renders.append(entry)
+    count = struct.unpack_from('<I', data, 4)[0]
+    version = struct.unpack_from('<I', data, 8)[0]
+    size = 108 if version >= 5 else 104
+    for i in range(count):
+        o = 12 + i * size
+        if o + size > len(data):
+            break
+        entry_id = struct.unpack_from('<I', data, o)[0]
+        name_at = o + 4
+        if version >= 5 and not _printable(data, o + 4) and _printable(data, o + 8):
+            name_at = o + 8  # some custom v5 files put the extra u32 first
+        point = data[name_at:name_at + 64].split(b'\x00', 1)[0].decode('latin-1', errors='replace')
+        fields_at = name_at + 64
+        trigger = struct.unpack_from('<I', data, fields_at)[0] if fields_at + 4 <= len(data) else 0
+        anim = struct.unpack_from('<I', data, fields_at + 4)[0] if fields_at + 8 <= len(data) else 0
+        duration = struct.unpack_from('<I', data, fields_at + 20)[0] if fields_at + 24 <= len(data) else 0
+        renders.append({
+            'id': entry_id,
+            'particle_point': point,
+            'triggered': trigger == 1,
+            'anim': anim,
+            'duration': duration,
+        })
     return renders
+
+
+def _printable(data, at):
+    if at + 1 >= len(data):
+        return False
+    return (0x21 <= data[at] < 0x7F) and (0x20 <= data[at + 1] < 0x7F)
 
 
 def parse_eff(data):
