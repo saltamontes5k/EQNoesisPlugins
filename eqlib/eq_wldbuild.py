@@ -604,12 +604,16 @@ def build_wld_anims_multi(wlds, bones, axis='nonzone'):
                 matches.append((bone_by_suffix[rest], anim_name))
             elif len(rest) > 1 and rest[1:] in bone_by_suffix:
                 matches.append((bone_by_suffix[rest[1:]], anim_name + rest[0]))
-            else:
-                # suffix match: dag names may carry extra prefixes
-                for key, idx in bone_by_suffix.items():
-                    if key.endswith(rest):
-                        matches.append((idx, anim_name))
-                        break
+            elif rest:
+                # suffix match: dag names may carry extra prefixes. Prefer the
+                # LONGEST candidate (most specific) and iterate in sorted order
+                # - iterating the dict directly picked an arbitrary bone, and
+                # an empty suffix (the actor-level "AUK_TRACK" / "ZOF_TRACK"
+                # fragments) matched every bone at once.
+                cands = [k for k in bone_by_suffix.keys() if k.endswith(rest)]
+                if cands:
+                    cands.sort(key=len, reverse=True)
+                    matches.append((bone_by_suffix[cands[0]], anim_name))
             if not matches:
                 continue
             bone_idx, anim_name = matches[0]
