@@ -128,9 +128,25 @@ class WldMaterialBank(object):
         base_name = mat.name or 'mat_%d' % mat.frag_index
         noe_mat = NoeMaterial(base_name, tex_label)
         r, g, b, a = mat.rgb_pen
-        noe_mat.setDiffuseColor(NoeVec4([r / 255.0, g / 255.0, b / 255.0, a / 255.0]))
+        alpha = a / 255.0
+        if kind == 'translucent':
+            # 0x05/0x0A/0x0B are EQ's see-through methods (50/25/75%). Drawn
+            # opaque, every smoke card becomes a solid plane - ael_chr's air
+            # elemental turns into a pile of grey sheets. Everquest_Model_
+            # Viewer draws this kind alpha-blended at that opacity.
+            alpha = 0.25 if rm_low == 0x0A else 0.75 if rm_low == 0x0B else 0.5
+        else:
+            # EQ leaves the pen alpha at 0 for lit materials; force opaque so
+            # nothing depends on the host ignoring alpha without a blend flag.
+            alpha = 1.0
+        noe_mat.setDiffuseColor(NoeVec4([r / 255.0, g / 255.0, b / 255.0, alpha]))
+        mflags = 0
         if mat.flags & 0x01 or kind in ('cutout', 'translucent', 'glow'):
-            noe_mat.setFlags(noesis.NMATFLAG_TWOSIDED)
+            mflags |= noesis.NMATFLAG_TWOSIDED
+        if kind == 'translucent':
+            mflags |= getattr(noesis, 'NMATFLAG_BASICBLEND', 0)
+        if mflags:
+            noe_mat.setFlags(mflags)
         if kind == 'cutout':
             # EQ's cut-out method is a mask in the texture (8-bit BMPs get
             # palette index 0 as alpha, see eq_material). Without an alpha
